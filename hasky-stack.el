@@ -267,6 +267,13 @@ failure.  Returned path is guaranteed to have trailing slash."
   "Return time of last modification of file FILENAME."
   (nth 5 (file-attributes filename 'integer)))
 
+(defun hasky-stack--shell-command (cmd)
+  "Like shell-command-to-string, but chops off trailing whitespace."
+  (let ((val (shell-command-to-string cmd)))
+    (if (string-match "^\\(.*\\)\\s-*$" val) ; $ matches before a final newline
+        (match-string 1 val)
+      val)))
+
 (defun hasky-stack--executable ()
   "Return path to stack executable if it's available and NIL otherwise."
   (let ((default "stack")
@@ -277,12 +284,17 @@ failure.  Returned path is guaranteed to have trailing slash."
 
 (defun hasky-stack--index-file ()
   "Get path to Hackage index file."
-  (f-expand "indices/Hackage/00-index.tar" hasky-stack-config-dir))
+  (let ((base (hasky-stack--shell-command
+               (concat "find " hasky-stack-config-dir " -iname hackage"))))
+    (f-expand "00-index.tar" base)))
 
+;; REVIEW this unpacked index is huge. Is there a way to save a smaller tree or file?
 (defun hasky-stack--index-dir ()
-  "Get path to directory that is to contain unpackaed Hackage index."
-  (file-name-as-directory
-   (f-expand "indices/Hackage/00-index" hasky-stack-config-dir)))
+  "Get path to directory that contains unpacked Hackage index."
+  (let ((base (hasky-stack--shell-command
+               (concat "find " hasky-stack-config-dir " -iname hackage"))))
+    (file-name-as-directory
+     (f-expand "00-index" base))))
 
 (defun hasky-stack--index-stamp-file ()
   "Get path to Hackage index time stamp file."
@@ -290,9 +302,7 @@ failure.  Returned path is guaranteed to have trailing slash."
 
 (defun hasky-stack--ensure-indices ()
   "Make sure that we have downloaded and untar-ed Hackage package indices.
-
-This uses external ‘tar’ command, so it probably won't work on
-Windows."
+This uses external ‘tar’ command, so it probably won't work on Windows."
   (let ((index-file (hasky-stack--index-file))
         (index-dir (hasky-stack--index-dir))
         (index-stamp (hasky-stack--index-stamp-file)))

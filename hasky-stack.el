@@ -271,8 +271,9 @@ failure.  Returned path is guaranteed to have trailing slash."
   "Return path to stack executable if it's available and NIL otherwise."
   (let ((default "stack")
         (custom  hasky-stack-executable))
-    (cond ((executable-find default)     default)
-          ((and custom (f-file? custom)) custom))))
+    (cond
+     ((and custom (f-executable? custom)) custom)
+     ((executable-find default) default))))
 
 (defun hasky-stack--index-file ()
   "Get path to Hackage index file."

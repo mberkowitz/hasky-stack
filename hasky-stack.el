@@ -267,13 +267,6 @@ failure.  Returned path is guaranteed to have trailing slash."
   "Return time of last modification of file FILENAME."
   (nth 5 (file-attributes filename 'integer)))
 
-(defun hasky-stack--shell-command (cmd)
-  "Like shell-command-to-string, but chops off trailing whitespace."
-  (let ((val (shell-command-to-string cmd)))
-    (if (string-match "^\\(.*\\)\\s-*$" val) ; $ matches before a final newline
-        (match-string 1 val)
-      val)))
-
 (defun hasky-stack--executable ()
   "Return path to stack executable if it's available and NIL otherwise."
   (let ((default "stack")
@@ -282,60 +275,50 @@ failure.  Returned path is guaranteed to have trailing slash."
      ((and custom (f-executable? custom)) custom)
      ((executable-find default) default))))
 
-(defun hasky-stack--index-file ()
-  "Get path to Hackage index file."
-  (let ((base (hasky-stack--shell-command
-               (concat "find " hasky-stack-config-dir " -iname hackage"))))
-    (f-expand "00-index.tar" base)))
+(defvar hasky-stack--packages nil
+  "(cached) list of all packages in local stack repo")
+(defvar hasky-stack--packages-with-versions nil
+  "(cached) list of all packages with versions; 
+   an association list with elements (PKG VERSIONS+)")
 
-;; REVIEW this unpacked index is huge. Is there a way to save a smaller tree or file?
-(defun hasky-stack--index-dir ()
-  "Get path to directory that contains unpacked Hackage index."
-  (let ((base (hasky-stack--shell-command
-               (concat "find " hasky-stack-config-dir " -iname hackage"))))
-    (file-name-as-directory
-     (f-expand "00-index" base))))
-
-(defun hasky-stack--index-stamp-file ()
-  "Get path to Hackage index time stamp file."
-  (f-expand "ts" (hasky-stack--index-dir)))
-
-(defun hasky-stack--ensure-indices ()
-  "Make sure that we have downloaded and untar-ed Hackage package indices.
-This uses external ‘tar’ command, so it probably won't work on Windows."
-  (let ((index-file (hasky-stack--index-file))
-        (index-dir (hasky-stack--index-dir))
-        (index-stamp (hasky-stack--index-stamp-file)))
-    (unless (f-file? index-file)
-      ;; No indices in place, need to run stack update to get them.
-      (message "Cannot find Hackage indices, trying to download them")
-      (shell-command (concat (hasky-stack--executable) " update")))
-    (if (f-file? index-file)
-        (when (or (not (f-file? index-stamp))
-                  (time-less-p (hasky-stack--mod-time index-stamp)
-                               (hasky-stack--mod-time index-file)))
-          (f-mkdir index-dir)
-          (let ((default-directory index-dir))
-            (message "Extracting Hackage indices, please be patient")
-            (shell-command
-             (concat "tar -xf " (shell-quote-argument index-file))))
-          (f-touch index-stamp)
-          (message "Finished preparing Hackage indices"))
-      (error "%s" "Failed to fetch indices, something is wrong!"))))
-
+(defun hasky-stack--get-packages ()
+  "Loads the lists of all local stack packages."
+  (let* (index                                  ; list of (PACKAGE VERSION+)
+         pairs                                  ; list of (PACKAGE . VERSION)
+         (pattern "\\(\\w+\\)-\\([0-9.]+\\)")   ; PACKAGE-VERSION
+         (strict-pattern (concat "^\\s-*" pattern "\\s-*$")))
+    ;; call ghc-pkg:
+    (with-temp-buffer
+      (shell-command "stack exec -- ghc-pkg --simple-output list" t)
+      (goto-char (point-min))
+      (keep-lines strict-pattern)
+      (goto-char (point-min))
+      (while (re-search-forward pattern nil t)
+        (setq pairs (cons (cons (match-string 1) (match-string 2)) pairs)))
+      (setq pairs (nreverse pairs)))
+    ;; convert the list of pairs to an association list keys on packages
+    (mapc
+     (lambda (pair)
+       (let* ((pkg (car pair))
+              (ver (cdr pair))
+              (item (assq pkg index)))
+         (if item (setcdr item (cons ver (cdr item)))
+           (setq index (cons (list pkg ver) index)))))
+     pairs)
+    (setq hasky-stack--packages-with-versions index)
+    (setq hasky-stack--packages (mapcar #'car index))))
+          
 (defun hasky-stack--packages ()
-  "Return list of all packages in Hackage indices."
-  (hasky-stack--ensure-indices)
-  (mapcar
-   #'f-filename
-   (f-entries (hasky-stack--index-dir) #'f-directory?)))
+  "Return list of all local stack packages"
+  (unless hasky-stack--packages
+    (hasky-stack--get-packages))
+  hasky-stack--packages)
 
 (defun hasky-stack--package-versions (package)
   "Return list of all available versions of PACKAGE."
-  (mapcar
-   #'f-filename
-   (f-entries (f-expand package (hasky-stack--index-dir))
-              #'f-directory?)))
+  (unless hasky-stack--packages-with-versions
+    (hasky-stack--get-packages))
+  (cdr (assq package hasky-stack--packages-with-versions)))
 
 (defun hasky-stack--latest-version (versions)
   "Return latest version from VERSIONS."
@@ -910,14 +893,12 @@ This uses `compile' internally."
 (defun hasky-stack-package-open-home-page (package)
   "Open home page of PACKAGE."
   (interactive (list hasky-stack--package-action-package))
-  (let* ((versions (hasky-stack--package-versions package))
-         (latest-version (hasky-stack--latest-version versions))
-         (cabal-file (f-join (hasky-stack--index-dir)
-                             package
-                             latest-version
-                             (concat package ".cabal")))
-         (homepage (hasky-stack--home-page-from-cabal-file cabal-file)))
-    (browse-url homepage)))
+  (let* ((result
+          (shell-command-to-string
+           (concat "stack exec -- ghc-pkg field " package " homepage")))
+         (url (and (string-match "^homepage: \\(.+\\)$" result)
+                   (match-string 1 result))))
+    (if url (browse-url url))))
 
 (defun hasky-stack-package-open-changelog (package)
   "Open Hackage build matrix for PACKAGE."
@@ -973,13 +954,7 @@ obviously template name."
 
 ;;;###autoload
 (defun hasky-stack-package-action (package)
-  "Open a popup allowing to install or request information about PACKAGE.
-
-This functionality currently relies on existence of ‘tar’
-command.  This means that it works on Posix systems, but may have
-trouble working on Windows.  Please let me know if you run into
-any issues on Windows and we'll try to work around (I don't have
-a Windows machine)."
+  "Open a popup allowing to install or request information about PACKAGE."
   (interactive
    (list (hasky-stack--completing-read
           "Package: "

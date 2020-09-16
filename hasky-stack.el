@@ -53,11 +53,11 @@
 
 (defgroup hasky-stack nil
   "Interface to the Stack Haskell development tool."
-  :group  'programming
+  ;; group=haskell if it exists
+  :group  (if (get 'haskell 'custom-group) 'haskell 'programming)
   :tag    "Hasky Stack"
   :prefix "hasky-stack-"
-  :link   '(url-link :tag "GitHub"
-                     "https://github.com/hasky-mode/hasky-stack"))
+  :link   '(url-link :tag "GitHub" "https://github.com/hasky-mode/hasky-stack"))
 
 (defface hasky-stack-project-name
   '((t (:inherit font-lock-function-name-face)))

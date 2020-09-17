@@ -1,6 +1,7 @@
 ;;; hasky-stack.el --- Interface to the Stack Haskell development tool -*- lexical-binding: t; -*-
 ;;
 ;; Copyright © 2017–2019 Mark Karpov <markkarpov92@gmail.com>
+;; Copyright © 2020 Marc Berkowitz <mberkowitz7@gmail.com>
 ;;
 ;; Author: Mark Karpov <markkarpov92@gmail.com>
 ;; URL: https://github.com/hasky-mode/hasky-stack
@@ -123,6 +124,11 @@ being used to compose command line."
   "GHC versions to pick from (for commands like \"stack setup\")."
   :tag  "GHC versions"
   :type '(repeat (string :tag "Extension name")))
+
+(defcustom hasky-stack-edit-the-command nil
+  "Whether to let user edit each stack command before running it."
+  :tag "Edit each stack command before running it"
+  :type 'boolean)
 
 (defcustom hasky-stack-auto-target nil
   "Whether to automatically select the default build target."
@@ -460,7 +466,8 @@ Result is expected to be used as argument of `compile'."
   "Call stack for PACKAGE as if from DIR performing COMMAND with arguments ARGS.
 
 Arguments are quoted if necessary and NIL arguments are ignored.
-This uses `compile' internally."
+When hasky-stack-edit-the-command is true, let the user edit the
+stack command first. This uses `compile' internally."
   (let ((default-directory dir)
         (compilation-buffer-name-function
          (lambda (_major-mode)
@@ -470,8 +477,11 @@ This uses `compile' internally."
                      "[[:space:]]"
                      "-"
                      (or package "hasky")))
-                   "stack"))))
-    (compile (apply #'hasky-stack--format-command command args))
+                   "stack")))
+        (stack-command (apply #'hasky-stack--format-command command args)))
+    (if hasky-stack-edit-the-command
+      (setq stack-command (compilation-read-command stack-command)))
+    (compile stack-command)
     nil))
 
 
@@ -500,8 +510,8 @@ This uses `compile' internally."
   (lambda (&rest args2)
     (interactive)
     (apply fun (append args args2))))
-
 
+
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Popups
 
@@ -840,7 +850,15 @@ This uses `compile' internally."
                    ,(hasky-stack--acp
                      #'hasky-stack--format-bool-variable
                      'hasky-stack-auto-newest-version
-                     "Auto newest version")))
+                     "Auto newest version"))
+               (?E "edit-command"
+                   ,(hasky-stack--acp
+                     #'hasky-stack--cycle-bool-variable
+                     'hasky-stack-edit-the-command)
+                   ,(hasky-stack--acp
+                     #'hasky-stack--format-bool-variable
+                     'hasky-stack-edit-the-command
+                     "Edit command before running.")))
   :options   '((?r "Resolver to use" "--resolver="))
   :actions   '((?i "Install"      hasky-stack-package-install)
                (?h "Hackage"      hasky-stack-package-open-hackage)
@@ -866,24 +884,29 @@ This uses `compile' internally."
    (hasky-stack--package-with-version package version)
    args))
 
+(defun hasky-stack--browse-url (url)
+  (when hasky-stack-edit-the-command
+    (setq url (read-string "Browse: " url nil url)))
+  (browse-url url))
+
 (defun hasky-stack-package-open-hackage (package)
   "Open Hackage page for PACKAGE."
   (interactive (list hasky-stack--package-action-package))
-  (browse-url
+  (hasky-stack--browse-url
    (concat "https://hackage.haskell.org/package/"
            (url-hexify-string package))))
 
 (defun hasky-stack-package-open-stackage (package)
   "Open Stackage page for PACKAGE."
   (interactive (list hasky-stack--package-action-package))
-  (browse-url
+  (hasky-stack--browse-url
    (concat "https://www.stackage.org/package/"
            (url-hexify-string package))))
 
 (defun hasky-stack-package-open-build-matrix (package)
   "Open Hackage build matrix for PACKAGE."
   (interactive (list hasky-stack--package-action-package))
-  (browse-url
+  (hasky-stack--browse-url
    (concat "https://matrix.hackage.haskell.org/package/"
            (url-hexify-string package))))
 
@@ -895,12 +918,12 @@ This uses `compile' internally."
            (concat "stack exec -- ghc-pkg field " package " homepage")))
          (url (and (string-match "^homepage: \\(.+\\)$" result)
                    (match-string 1 result))))
-    (if url (browse-url url))))
+    (if url (hasky-stack--browse-url url))))
 
 (defun hasky-stack-package-open-changelog (package)
   "Open Hackage build matrix for PACKAGE."
   (interactive (list hasky-stack--package-action-package))
-  (browse-url
+  (hasky-stack--browse-url
    (concat "https://hackage.haskell.org/package/"
            (url-hexify-string
             (hasky-stack--package-with-version
@@ -908,6 +931,28 @@ This uses `compile' internally."
              (hasky-stack--latest-version
               (hasky-stack--package-versions package))))
            "/changelog")))
+
+;; add to all popups: E toggles hasky-stack-edit-the-command
+(let ((cmd
+       (hasky-stack--acp
+        #'hasky-stack--cycle-bool-variable
+        'hasky-stack-edit-the-command))
+      (fmt
+       (hasky-stack--acp
+        #'hasky-stack--format-bool-variable
+        'hasky-stack-edit-the-command
+        "Edit the stack command before it runs"))
+      (stack-popups
+       '(hasky-stack-build-popup
+         hasky-stack-init-popup
+         hasky-stack-setup-popup
+         hasky-stack-upgrade-popup
+         hasky-stack-upload-popup
+         hasky-stack-sdist-popup
+         hasky-stack-clean-popup)))
+  (mapc
+   (lambda (p) (magit-define-popup-variable p ?E nil cmd stack-fmt))
+   stack-popups))
 
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -976,14 +1021,14 @@ STR describes how the process finished."
       (when (and hasky-stack-auto-open-coverage-reports
                  (re-search-forward
                   "^The coverage report for .+'s test-suite \".+\" is available at \\(.*\\)$" nil t))
-        (browse-url (match-string-no-properties 1)))
+        (hasky-stack--browse-url (match-string-no-properties 1)))
       (cl-flet ((open-haddock
                  (regexp)
                  (goto-char (point-min))
                  (when (and hasky-stack-auto-open-haddocks
                             (re-search-forward regexp nil t))
-                   (browse-url (f-expand (match-string-no-properties 1)
-                                         hasky-stack--last-directory))
+                   (hasky-stack--browse-url
+                    (f-expand (match-string-no-properties 1) hasky-stack--last-directory))
                    t)))
         (or (open-haddock "^Documentation created:\n\\(.*\\),$")
             (open-haddock "^Haddock index for local packages already up to date at:\n\\(.*\\)$")

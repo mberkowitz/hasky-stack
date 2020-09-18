@@ -52,6 +52,23 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Settings & Variables
 
+;; Nomenclature:
+;;
+;; Both stack and cabal manage PACKAGES: the units of downloading, building,
+;; installing locally and uploading. There are various ways to classify
+;; packages: local vs remote; hackage vs stackage vs other; parts of the project
+;; vs its dependencies vs unrelated packages. Some packages are simple (defined
+;; by one cabal file) and some are compound (defined by a cabal.project and
+;; several cabal files). (And hasky-stack is an emacs package.)
+;;
+;; Hasky-stack is a tool for inspecting and building stack packages. We will
+;; call the unit for building code a PROJECT, since the word has no specical
+;; meaning to stack, and does suggest cabal.project. (TARGET will mean stack
+;; build target). For purposes of download and upload, a project is one stack
+;; package. For purposes of building and testing, a project may be a simple
+;; stack package, or a compound with subpackages. We assume that the subpackages
+;; make a list and not a tree.
+
 (defgroup hasky-stack nil
   "Interface to the Stack Haskell development tool."
   ;; group=haskell if it exists
@@ -68,34 +85,26 @@
   '((t (:inherit font-lock-doc-face)))
   "Face used to display version of current project.")
 
-(defvar hasky-stack--last-directory nil
-  "Path to project's directory last time `hasky-stack--prepare' was called.
+;; the next 6 vars are set by `hasky-stack--prepare`:
+(defvar hasky-stack--project-directory nil "Path to top of current stack project")
+(defvar hasky-stack--project-name nil "Name of current stack project")
+(defvar hasky-stack--project-version nil "Version of current stack project")
+(defvar hasky-stack--project-is-compound nil "Does current stack project contain subpackages?")
+(defvar hasky-stack--cabal-project-mod-time nil "Time of last mod to cabal.project, if any")
+  
+(defvar hasky-stack--project-packages nil
+  "A list of the packages contained in the current project, with their attributes.
+   Each item corresponds to a .cabal file in the project. Each
+   item is an a-list, made by (hasky-stack--parse-cabal-file).
+   The attributes of a package are: name, version, targets, dir,
+   cabal-file-name, cabal-file-mod-time.")
 
-This is mainly used to check when we need to reload/re-parse
-project-local settings that user might have.")
-
-(defvar hasky-stack--cabal-mod-time nil
-  "Time of last modification of \"*.cabal\" file.
-
-This is usually set by `hasky-stack--prepare'.")
-
-(defvar hasky-stack--project-name nil
-  "Name of current project extracted from \"*.cabal\" file.
-
-This is usually set by `hasky-stack--prepare'.")
-
-(defvar hasky-stack--project-version nil
-  "Version of current project extracted from \"*.cabal\" file.
-
-This is usually set by `hasky-stack--prepare'.")
-
-(defvar hasky-stack--project-targets nil
-  "List of build targets (strings) extracted from \"*.cabal\" file.
-
-This is usually set by `hasky-stack--prepare'.")
+(defvar hasky-stack--current-package nil
+  "Defines the package that is the current scope for `stack build' and the like.
+   An item from the list hasky-stack--project-packages.")
 
 (defvar hasky-stack--package-action-package nil
-  "This variable is temporarily bound to name of package.")
+  "This variable is temporarily bound to name of a package.")
 
 (defcustom hasky-stack-executable nil
   "Path to Stack executable.
@@ -193,6 +202,18 @@ This is used in `hasky-stack-package-action'."
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Various utilities
 
+(defun hasky-stack--package-targets(&optional pkg)
+  (cdr (assq 'targets (or pkg hasky-stack--current-package))))
+
+(defun hasky-stack--package-version(&optional pkg)
+  (cdr (assq 'version (or pkg hasky-stack--current-package))))
+
+(defun hasky-stack--package-name(&optional pkg)
+  (cdr (assq 'name (or pkg hasky-stack--current-package))))
+
+(defun hasky-stack--package-directory(&optional pkg)
+  (cdr (assq 'dir (or pkg hasky-stack--current-package))))
+
 (defun hasky-stack--all-matches (regexp)
   "Return list of all stings matching REGEXP in current buffer."
   (let (matches
@@ -203,45 +224,56 @@ This is used in `hasky-stack-package-action'."
     (reverse matches)))
 
 (defun hasky-stack--parse-cabal-file (filename)
-  "Parse \"*.cabal\" file with name FILENAME and set some variables.
+  "Parse the \"*.cabal\" file with name FILENAME and return an
+  a-list, with the fields name, version, targets,
+  cabal-file-name, cabal-file-mod-time. This is used by
+  `hasky-stack--prepare'."
+  (let (name version targets)
+    (with-temp-buffer
+      (insert-file-contents filename)
+      ;; project name
+      (setq name
+            (car (hasky-stack--all-matches
+                  "^[[:blank:]]*name:[[:blank:]]+\\([[:word:]-]+\\)")))
+      ;; project version
+      (setq version
+            (car (hasky-stack--all-matches
+                  "^[[:blank:]]*version:[[:blank:]]+\\([[:digit:]\\.]+\\)")))
+      ;; project targets
+      (setq
+       targets
+       (append
+        ;; library
+        (mapcar (lambda (_) (format "%s:lib" name))
+                (hasky-stack--all-matches
+                 "^[[:blank:]]*library[[:blank:]]*"))
+        ;; executables
+        (mapcar (lambda (x) (format "%s:exe:%s" name x))
+                (hasky-stack--all-matches
+                 "^[[:blank:]]*executable[[:blank:]]+\\([[:word:]-]+\\)"))
+        ;; test suites
+        (mapcar (lambda (x) (format "%s:test:%s" name x))
+                (hasky-stack--all-matches
+                 "^[[:blank:]]*test-suite[[:blank:]]+\\([[:word:]-]+\\)"))
+        ;; benchmarks
+        (mapcar (lambda (x) (format "%s:bench:%s" name x))
+                (hasky-stack--all-matches
+                 "^[[:blank:]]*benchmark[[:blank:]]+\\([[:word:]-]+\\)")))))
+    `((name . ,name) (version . ,version) (targets ,@targets)
+      (dir . ,(f-dirname (f-canonical filename)))
+      (cabal-file-name . ,filename)
+      (cabal-file-mod-time . ,(hasky-stack--mod-time filename)))))
 
-The following variables are set:
-
-  `hasky-stack--project-name'
-  `hasky-stack--project-version'
-  `hasky-stack--project-targets'
-
-This is used by `hasky-stack--prepare'."
-  (with-temp-buffer
-    (insert-file-contents filename)
-    ;; project name
-    (setq hasky-stack--project-name
-          (car (hasky-stack--all-matches
-                "^[[:blank:]]*name:[[:blank:]]+\\([[:word:]-]+\\)")))
-    ;; project version
-    (setq hasky-stack--project-version
-          (car (hasky-stack--all-matches
-                "^[[:blank:]]*version:[[:blank:]]+\\([[:digit:]\\.]+\\)")))
-    ;; project targets
-    (setq
-     hasky-stack--project-targets
-     (append
-      ;; library
-      (mapcar (lambda (_) (format "%s:lib" hasky-stack--project-name))
-              (hasky-stack--all-matches
-               "^[[:blank:]]*library[[:blank:]]*"))
-      ;; executables
-      (mapcar (lambda (x) (format "%s:exe:%s" hasky-stack--project-name x))
-              (hasky-stack--all-matches
-               "^[[:blank:]]*executable[[:blank:]]+\\([[:word:]-]+\\)"))
-      ;; test suites
-      (mapcar (lambda (x) (format "%s:test:%s" hasky-stack--project-name x))
-              (hasky-stack--all-matches
-               "^[[:blank:]]*test-suite[[:blank:]]+\\([[:word:]-]+\\)"))
-      ;; benchmarks
-      (mapcar (lambda (x) (format "%s:bench:%s" hasky-stack--project-name x))
-              (hasky-stack--all-matches
-               "^[[:blank:]]*benchmark[[:blank:]]+\\([[:word:]-]+\\)"))))))
+(defun hasky-stack--maybe-reload-package (pkg)
+  "PKG is an a-list describing a cabal package, as returned by hasky-stack--parse-cabal-file.
+   If the cabal file has changed since its timestamp saved in the
+   a-list, parse it again and return the new value. If not, just
+   return PKG."
+  (let ((file (cdr (assq 'cabal-file-name pkg)))
+        (time (cdr (assq 'cabal-file-mod-time pkg))))
+    (if (time-less-p time (hasky-stack--mod-time file))
+        (hasky-stack--parse-cabal-file file)
+      pkg)))
 
 (defun hasky-stack--home-page-from-cabal-file (filename)
   "Parse package home page from \"*.cabal\" file with FILENAME."
@@ -271,7 +303,7 @@ failure.  Returned path is guaranteed to have trailing slash."
 
 (defun hasky-stack--mod-time (filename)
   "Return time of last modification of file FILENAME."
-  (nth 5 (file-attributes filename 'integer)))
+  (and filename (nth 5 (file-attributes filename 'integer))))
 
 (defun hasky-stack--executable ()
   "Return path to stack executable if it's available and NIL otherwise."
@@ -281,13 +313,13 @@ failure.  Returned path is guaranteed to have trailing slash."
      ((and custom (f-executable? custom)) custom)
      ((executable-find default) default))))
 
-(defvar hasky-stack--packages nil
-  "(cached) list of all packages in local stack repo")
-(defvar hasky-stack--packages-with-versions nil
-  "(cached) list of all packages with versions;
+(defvar hasky-stack--all-packages nil
+  "(cached) list of all local stack packages")
+(defvar hasky-stack--all-packages-with-versions nil
+  "(cached) list of all local stack packages with versions;
    an association list with elements (PKG VERSIONS+)")
 
-(defun hasky-stack--get-packages ()
+(defun hasky-stack--get-all-packages ()
   "Loads the lists of all local stack packages."
   (let* (index                                  ; list of (PACKAGE VERSION+)
          pairs                                  ; list of (PACKAGE . VERSION)
@@ -308,20 +340,20 @@ failure.  Returned path is guaranteed to have trailing slash."
          (if item (setcdr item (cons ver (cdr item)))
            (setq index (cons (list pkg ver) index)))))
      pairs)
-    (setq hasky-stack--packages-with-versions index)
-    (setq hasky-stack--packages (mapcar #'car index))))
+    (setq hasky-stack--all-packages-with-versions index)
+    (setq hasky-stack--all-packages (mapcar #'car index))))
 
-(defun hasky-stack--packages ()
+(defun hasky-stack--all-packages ()
   "Return list of all local stack packages"
-  (unless hasky-stack--packages
-    (hasky-stack--get-packages))
-  hasky-stack--packages)
+  (unless hasky-stack--all-packages
+    (hasky-stack--get-all-packages))
+  hasky-stack--all-packages)
 
 (defun hasky-stack--package-versions (package)
   "Return list of all available versions of PACKAGE."
-  (unless hasky-stack--packages-with-versions
-    (hasky-stack--get-packages))
-  (cdr (assq package hasky-stack--packages-with-versions)))
+  (unless hasky-stack--all-packages-with-versions
+    (hasky-stack--get-all-packages))
+  (cdr (assq package hasky-stack--all-packages-with-versions)))
 
 (defun hasky-stack--latest-version (versions)
   "Return latest version from VERSIONS."
@@ -365,22 +397,37 @@ Finally, if COLLECTION is nil, plain `read-string' is used."
                  (member result collection))
       result)))
 
+(defun hasky-stack-set-current-package (pkg)
+  "Select a package in the current package to be the focus of stack build commands.
+PKG is a cabal package description returned by `hasky-stack--parse-cabal-file'.
+Interactively (and from root popup) lets the user pick from a list."
+  (interactive (list (hasky-stack--select-project-package "package: ")))
+  (setq hasky-stack--current-package pkg))
+
+(defun hasky-stack--select-project-package (prompt)
+  (let* ((all hasky-stack--project-packages)
+         (names (mapcar #'hasky-stack--package-name all))
+         (chosen (hasky-stack--completing-read prompt names)))
+    (cl-find-if
+     (lambda (item) (equal chosen (hasky-stack--package-name item)))
+     all)))
+
 (defun hasky-stack--select-target (prompt &optional fragment)
   "Present the user with a choice of build target using PROMPT.
 
 If given, FRAGMENT will be as a filter so only targets that
 contain this string will be returned."
   (if hasky-stack-auto-target
-      hasky-stack--project-name
+      (hasky-stack--package-name)
     (hasky-stack--completing-read
      prompt
-     (cons hasky-stack--project-name
+     (cons (hasky-stack--package-name)
            (if fragment
                (cl-remove-if
                 (lambda (x)
                   (not (string-match-p (regexp-quote fragment) x)))
-                hasky-stack--project-targets)
-             hasky-stack--project-targets)
+                (hasky-stack--package-targets))
+             (hasky-stack--package-targets))
            )
      t)))
 
@@ -401,48 +448,76 @@ contain this string will be returned."
 (defun hasky-stack--prepare ()
   "Locate, read, and parse configuration files and set various variables.
 
-This commands searches for first \"*.cabal\" files traversing
-directories upwards beginning with `default-directory'.  When
-Cabal file is found, the following variables are set:
+This command finds and parses all .cabal files in the current
+project. Starting from the current directory, and moving upwards,
+it looks for stack.yaml, package.yaml, or cabal.project; this is
+taken to be the top directory of the project. It then searches
+downwards for .cabal files, but ignores any directory that
+appears to be another project tree (ie that containes stack.yaml,
+package.yaml, or cabal.project).
 
-  `hasky-stack--project-name'
-  `hasky-stack--project-version'
-  `hasky-stack--project-targets'
+Each cabal file is parsed into a list of package attributes,
+which is appended to the variable hasky-stack--project-packages.
+This function avoids reparsing unchanged cabal files.
+Fails by throwing an error."
 
-At the end, `hasky-stack--last-directory' and
-`hasky-stack--cabal-mod-time' are set.  Note that this function
-is smart enough to avoid re-parsing all the stuff every time.  It
-can detect when we are in different project or when some files
-have been changed since its last invocation.
-
-Returned value is T on success and NIL on failure (when no
-\"*.cabal\" files is found)."
-  (let* ((project-directory
-          (hasky-stack--find-dir-of-file "^.+\.cabal$"))
-         (cabal-file
-          (car (and project-directory
-                    (f-glob "*.cabal" project-directory)))))
-    (when cabal-file
-      (if (or (not hasky-stack--last-directory)
-              (not (f-same? hasky-stack--last-directory
-                            project-directory)))
-          (progn
-            ;; We are in different directory (or it's the first
-            ;; invocation). This means we should unconditionally parse
-            ;; everything without checking of date of last modification.
-            (hasky-stack--parse-cabal-file cabal-file)
-            (setq hasky-stack--cabal-mod-time (hasky-stack--mod-time cabal-file))
-            ;; Set last directory for future checks.
-            (setq hasky-stack--last-directory project-directory)
-            t) ;; Return T on success.
-        ;; We are in an already visited directory, so we don't need to reset
-        ;; `hasky-stack--last-directory' this time. We need to
-        ;; reread/re-parse *.cabal file if it has been modified though.
-        (when (time-less-p hasky-stack--cabal-mod-time
-                           (hasky-stack--mod-time cabal-file))
-          (hasky-stack--parse-cabal-file cabal-file)
-          (setq hasky-stack--cabal-mod-time (hasky-stack--mod-time cabal-file)))
-        t))))
+  (cl-flet ((find-cabal-files (dir) 
+             ;;find DIR -name \*.cabal
+             ;; TODO: should check results vs dir/cabal.project
+             (f-files dir (lambda (f) (equal (f-ext f) "cabal")) t))
+            (find-project-directory ()
+             (f-traverse-upwards
+              (lambda (dir)
+                (or (f-exists? (f-expand "cabal.project" dir))
+                    (f-exists? (f-expand "project.yaml" dir))
+                    (f-exists? (f-expand "stack.yaml" dir)))))))
+    (let* ((project-directory (find-project-directory))
+           (cabal-file
+            (and project-directory
+                 (car (f-glob "*.cabal" project-directory))))
+           (cabal-project-file
+            (and project-directory (f-expand "cabal.project" project-directory)))
+           (compound-project (f-exists? cabal-project-file))
+           (project-name
+            (if compound-project (f-base project-directory) (f-base cabal-file)))
+           (different-project
+            (or (not hasky-stack--project-directory)
+                (not (f-same? hasky-stack--project-directory project-directory))))
+           (reload-all
+            (or different-project
+                (and compound-project
+                     (time-less-p
+                      hasky-stack--cabal-project-mod-time
+                      (hasky-stack--mod-time cabal-project-file))))))
+      (unless (or compound-project (f-exists? cabal-file))
+        (error "%s" "Cannot find a .cabal file"))
+      (when different-project
+        (setq hasky-stack--project-directory project-directory
+              hasky-stack--project-name project-name
+              hasky-stack--project-version nil
+              hasky-stack--project-packages nil
+              hasky-stack--current-package nil
+              hasky-stack--cabal-project-mod-time
+              (hasky-stack--mod-time cabal-project-file)))
+      (cond (reload-all
+             ;; find and parse all .cabal files in this project:
+             (let ((cabal-files
+                    (if compound-project
+                        (find-cabal-files project-directory)
+                      (list cabal-file))))
+               (setq hasky-stack--project-packages
+                     (mapcar #'hasky-stack--parse-cabal-file cabal-files))))
+            (t
+             ;; otherwise, the list of cabal files is up to date, read the changed
+             ;; ones again:
+             (setq hasky-stack--project-packages
+                   (mapcar #'hasky-stack--maybe-reload-package
+                           hasky-stack--project-packages))))
+      (setq hasky-stack--project-is-compound
+            (consp (cdr hasky-stack--project-packages)))
+      (when different-project
+        (setq hasky-stack--current-package (car hasky-stack--project-packages)
+              hasky-stack--project-version (hasky-stack--package-version))))))
 
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -571,8 +646,8 @@ stack command first. This uses `compile' internally."
          (hasky-stack-build-arguments)))
   (apply
    #'hasky-stack--exec-command
-   hasky-stack--project-name
-   hasky-stack--last-directory
+   (hasky-stack--package-name)
+   (hasky-stack--package-directory)
    "build"
    target
    args))
@@ -584,8 +659,8 @@ stack command first. This uses `compile' internally."
          (hasky-stack-build-arguments)))
   (apply
    #'hasky-stack--exec-command
-   hasky-stack--project-name
-   hasky-stack--last-directory
+   (hasky-stack--package-name)
+   (hasky-stack--package-directory)
    "bench"
    target
    args))
@@ -597,8 +672,8 @@ stack command first. This uses `compile' internally."
          (hasky-stack-build-arguments)))
   (apply
    #'hasky-stack--exec-command
-   hasky-stack--project-name
-   hasky-stack--last-directory
+   (hasky-stack--package-name)
+   (hasky-stack--package-directory)
    "test"
    target
    args))
@@ -609,8 +684,8 @@ stack command first. This uses `compile' internally."
    (list (hasky-stack-build-arguments)))
   (apply
    #'hasky-stack--exec-command
-   hasky-stack--project-name
-   hasky-stack--last-directory
+   (hasky-stack--package-name)
+   (hasky-stack--package-directory)
    "haddock"
    args))
 
@@ -630,8 +705,8 @@ stack command first. This uses `compile' internally."
    (list (hasky-stack-init-arguments)))
   (apply
    #'hasky-stack--exec-command
-   hasky-stack--project-name
-   hasky-stack--last-directory
+   (hasky-stack--package-name)
+   (hasky-stack--package-directory)
    "init"
    args))
 
@@ -654,8 +729,8 @@ stack command first. This uses `compile' internally."
          (hasky-stack-setup-arguments)))
   (apply
    #'hasky-stack--exec-command
-   hasky-stack--project-name
-   hasky-stack--last-directory
+   (hasky-stack--package-name)
+   (hasky-stack--package-directory)
    "setup"
    (unless (string= ghc-version "implied-by-resolver")
      ghc-version)
@@ -682,7 +757,7 @@ stack command first. This uses `compile' internally."
   (apply
    #'hasky-stack--exec-command
    hasky-stack--project-name
-   hasky-stack--last-directory
+   hasky-stack--project-directory
    "upgrade"
    args))
 
@@ -704,7 +779,7 @@ stack command first. This uses `compile' internally."
   (apply
    #'hasky-stack--exec-command
    hasky-stack--project-name
-   hasky-stack--last-directory
+   hasky-stack--project-directory
    "upload"
    "."
    args))
@@ -726,7 +801,7 @@ stack command first. This uses `compile' internally."
   (apply
    #'hasky-stack--exec-command
    hasky-stack--project-name
-   hasky-stack--last-directory
+   hasky-stack--project-directory
    "sdist"
    args))
 
@@ -742,8 +817,8 @@ stack command first. This uses `compile' internally."
         (cons (match-string 1 cmd)
               (match-string 2 cmd)))
     (hasky-stack--exec-command
-     hasky-stack--project-name
-     hasky-stack--last-directory
+     (hasky-stack--package-name)
+     (hasky-stack--package-directory)
      (if (string= args "")
          (concat "exec " app)
        (concat "exec " app " -- " args)))))
@@ -760,8 +835,8 @@ stack command first. This uses `compile' internally."
         (cons (match-string 1 cmd)
               (match-string 2 cmd)))
     (hasky-stack--exec-command
-     hasky-stack--project-name
-     hasky-stack--last-directory
+     (hasky-stack--package-name)
+     (hasky-stack--package-directory)
      (if (string= args "")
          (concat "run " app)
        (concat "run " app " -- " args)))))
@@ -779,26 +854,32 @@ stack command first. This uses `compile' internally."
    (list (hasky-stack-clean-arguments)))
   (apply
    #'hasky-stack--exec-command
-   hasky-stack--project-name
-   hasky-stack--last-directory
+   (hasky-stack--package-name)
+   (hasky-stack--package-directory)
    "clean"
    (if (member "--full" args)
        args
-     (list hasky-stack--project-name))))
+     (list (hasky-stack--package-name)))))
+
+(defun hasky-stack--root-heading()
+  (concat
+   (propertize
+    (if hasky-stack--project-is-compound
+        (format "%s/%s"
+                hasky-stack--project-name
+                (hasky-stack--package-name))
+      (hasky-stack--package-name))
+    'face 'hasky-stack-project-name)
+   " "
+   (propertize (hasky-stack--package-version)
+               'face 'hasky-stack-project-version)
+   "\n\n"
+   (propertize "Commands" 'face 'magit-popup-heading)))
 
 (magit-define-popup hasky-stack-root-popup
   "Show root popup with all supported commands."
   'hasky-stack
-  :actions  '((lambda ()
-                (concat
-                 (propertize hasky-stack--project-name
-                             'face 'hasky-stack-project-name)
-                 " "
-                 (propertize hasky-stack--project-version
-                             'face 'hasky-stack-project-version)
-                 "\n\n"
-                 (propertize "Commands"
-                             'face 'magit-popup-heading)))
+  :actions  '((lambda () (hasky-stack--root-heading))
               (?b "Build"   hasky-stack-build-popup)
               (?i "Init"    hasky-stack-init-popup)
               (?s "Setup"   hasky-stack-setup-popup)
@@ -810,7 +891,8 @@ stack command first. This uses `compile' internally."
               (?r "Run"     hasky-stack-run)
               (?c "Clean"   hasky-stack-clean-popup)
               (?l "Edit Cabal file" hasky-stack-edit-cabal)
-              (?y "Edit stack.yaml" hasky-stack-edit-stack-yaml))
+              (?y "Edit stack.yaml" hasky-stack-edit-stack-yaml)
+              (?z "Change current sub-package" hasky-stack-set-current-package))
   :default-action 'hasky-stack-build-popup
   :max-action-columns 3)
 
@@ -819,24 +901,26 @@ stack command first. This uses `compile' internally."
   (interactive)
   (hasky-stack--exec-command
    hasky-stack--project-name
-   hasky-stack--last-directory
+   hasky-stack--project-directory
    "update"))
 
 (defun hasky-stack-edit-cabal ()
   "Open Cabal file of current project for editing."
   (interactive)
   (let ((cabal-file
-         (car (and hasky-stack--last-directory
-                   (f-glob "*.cabal" hasky-stack--last-directory)))))
+         (car (and (hasky-stack--package-directory)
+                   (f-glob "*.cabal" (hasky-stack--package-directory))))))
     (when cabal-file
       (find-file cabal-file))))
 
 (defun hasky-stack-edit-stack-yaml ()
   "Open \"stack.yaml\" of current project for editing."
   (interactive)
-  (let ((stack-yaml-file
-         (car (and hasky-stack--last-directory
-                   (f-glob "stack.yaml" hasky-stack--last-directory)))))
+  (let* ((pkgdir (hasky-stack--package-directory))
+         (prodir  hasky-stack--project-directory)
+         (stack-yaml-file
+          (or (car (and pkgdir (f-glob "stack.yaml" pkgdir)))
+              (car (and prodir (f-glob "stack.yaml" prodir))))))
     (when stack-yaml-file
       (find-file stack-yaml-file))))
 
@@ -951,7 +1035,7 @@ stack command first. This uses `compile' internally."
          hasky-stack-sdist-popup
          hasky-stack-clean-popup)))
   (mapc
-   (lambda (p) (magit-define-popup-variable p ?E nil cmd stack-fmt))
+   (lambda (p) (magit-define-popup-variable p ?E nil cmd fmt))
    stack-popups))
 
 
@@ -962,11 +1046,10 @@ stack command first. This uses `compile' internally."
 (defun hasky-stack-execute ()
   "Show the root-level popup allowing to choose and run a Stack command."
   (interactive)
-  (if (hasky-stack--executable)
-      (if (hasky-stack--prepare)
-          (hasky-stack-root-popup)
-        (message "Cannot locate ‘.cabal’ file"))
-    (error "%s" "Cannot locate Stack executable on this system")))
+  (unless (hasky-stack--executable)
+    (error "%s" "Cannot locate Stack executable on this system"))
+  (hasky-stack--prepare)
+  (hasky-stack-root-popup))
 
 ;;;###autoload
 (defun hasky-stack-new (project-name template)
@@ -984,7 +1067,7 @@ obviously template name."
           "Use template: "
           (cons "none" hasky-stack-templates)
           t)))
-  (if (hasky-stack--prepare)
+  (if (f-exists? (f-expand "stack.yaml" default-directory))
       (message "The directory is already initialized, it seems")
     (hasky-stack--exec-command
      project-name
@@ -1000,7 +1083,7 @@ obviously template name."
   (interactive
    (list (hasky-stack--completing-read
           "Package: "
-          (hasky-stack--packages)
+          (hasky-stack--all-packages)
           t)))
   (setq hasky-stack--package-action-package package)
   (hasky-stack-package-action-popup))
@@ -1028,7 +1111,7 @@ STR describes how the process finished."
                  (when (and hasky-stack-auto-open-haddocks
                             (re-search-forward regexp nil t))
                    (hasky-stack--browse-url
-                    (f-expand (match-string-no-properties 1) hasky-stack--last-directory))
+                    (f-expand (match-string-no-properties 1) (hasky-stack--package-directory)))
                    t)))
         (or (open-haddock "^Documentation created:\n\\(.*\\),$")
             (open-haddock "^Haddock index for local packages already up to date at:\n\\(.*\\)$")
@@ -1038,5 +1121,4 @@ STR describes how the process finished."
              #'hasky-stack--compilation-finish-function)
 
 (provide 'hasky-stack)
-
 ;;; hasky-stack.el ends here
